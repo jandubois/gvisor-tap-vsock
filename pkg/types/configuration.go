@@ -43,6 +43,12 @@ type Configuration struct {
 	// Port forwarding between the machine running the gateway and the virtual network.
 	Forwards map[string]string `yaml:"forwards,omitempty"`
 
+	// Connect forwarded ports to the virtual machine from the gateway IP instead
+	// of the client's IP. Set this when a client's IP can be inside a network
+	// that the VM routes elsewhere, such as a container bridge, because the VM
+	// then sends its replies into that network and the connection fails.
+	DisableSourceIPPropagation bool `yaml:"disableSourceIPPropagation,omitempty"`
+
 	// Address translation of incoming traffic.
 	// Useful for reaching the host itself (localhost) from the virtual network.
 	NAT map[string]string `yaml:"nat,omitempty"`

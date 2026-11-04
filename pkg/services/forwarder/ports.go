@@ -30,6 +30,11 @@ type ProxyKey string
 type PortsForwarder struct {
 	stack *stack.Stack
 
+	// DisableSourceIPPropagation makes exposed ports connect to the guest from
+	// the gateway address instead of the client's address. Set it before
+	// calling Expose.
+	DisableSourceIPPropagation bool
+
 	proxiesLock sync.Mutex
 	proxies     map[ProxyKey]proxy
 }
@@ -216,7 +221,7 @@ func (f *PortsForwarder) Expose(protocol types.TransportProtocol, local, remote 
 		}
 		p, err := NewUDPProxy(listener, func(from net.Addr) (net.Conn, error) {
 			var bindAddr *tcpip.FullAddress
-			if a, ok := from.(*net.UDPAddr); ok {
+			if a, ok := from.(*net.UDPAddr); ok && !f.DisableSourceIPPropagation {
 				bindAddr = SourceBindAddr(a.IP, a.Port)
 			}
 			return gonet.DialUDP(f.stack, bindAddr, &address, ipv4.ProtocolNumber)
@@ -242,7 +247,7 @@ func (f *PortsForwarder) Expose(protocol types.TransportProtocol, local, remote 
 			Addr: remote,
 			DialContext: func(ctx context.Context, _, _ string) (conn net.Conn, e error) {
 				var bindAddr tcpip.FullAddress
-				if a, ok := ctx.Value(tcpproxy.SourceAddrContextKey).(*net.TCPAddr); ok {
+				if a, ok := ctx.Value(tcpproxy.SourceAddrContextKey).(*net.TCPAddr); ok && !f.DisableSourceIPPropagation {
 					if b := SourceBindAddr(a.IP, a.Port); b != nil {
 						bindAddr = *b
 					}

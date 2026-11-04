@@ -105,97 +105,167 @@ var _ = ginkgo.Describe("source IP propagation", func() {
 	})
 })
 
+// forwardTCP connects to a TCP port exposed into the test stack and returns
+// the source IP that the guest-side listener saw and the client's IP.
+func forwardTCP(disableSourceIPPropagation bool) (seen, clientIP string) {
+	ip := hostIP()
+	if ip == nil {
+		ginkgo.Skip("no non-loopback IPv4 address found")
+	}
+
+	s := newTestStack()
+
+	childLn, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: 1, Addr: childIP, Port: 8080}, ipv4.ProtocolNumber)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer childLn.Close()
+
+	sourceAddrCh := make(chan string, 1)
+	go func() {
+		conn, err := childLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		sourceAddrCh <- conn.RemoteAddr().String()
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	listenAddr := freeHostAddr("tcp", ip)
+	fw := NewPortsForwarder(s)
+	fw.DisableSourceIPPropagation = disableSourceIPPropagation
+	gomega.Expect(fw.Expose(types.TCP, listenAddr, "10.0.2.100:8080")).Should(gomega.Succeed())
+	defer func() { _ = fw.Unexpose(types.TCP, listenAddr) }()
+
+	conn, err := net.Dial("tcp", listenAddr)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	clientIP = conn.LocalAddr().(*net.TCPAddr).IP.String()
+	conn.Close()
+
+	var addr string
+	gomega.Eventually(sourceAddrCh).WithTimeout(5 * time.Second).Should(gomega.Receive(&addr))
+	seen, _, err = net.SplitHostPort(addr)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	return seen, clientIP
+}
+
+// forwardUDP sends a datagram through a UDP port exposed into the test stack
+// and returns the source IP that the guest-side socket saw and the client's IP.
+func forwardUDP(disableSourceIPPropagation bool) (seen, clientIP string) {
+	ip := hostIP()
+	if ip == nil {
+		ginkgo.Skip("no non-loopback IPv4 address found")
+	}
+
+	s := newTestStack()
+
+	childAddr := tcpip.FullAddress{NIC: 1, Addr: childIP, Port: 8081}
+	childConn, err := gonet.DialUDP(s, &childAddr, nil, ipv4.ProtocolNumber)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer childConn.Close()
+
+	sourceAddrCh := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 1024)
+		n, from, err := childConn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		sourceAddrCh <- from.String()
+		// Echo back
+		_, _ = childConn.WriteTo(buf[:n], from)
+	}()
+
+	listenAddr := freeHostAddr("udp", ip)
+	fw := NewPortsForwarder(s)
+	fw.DisableSourceIPPropagation = disableSourceIPPropagation
+	gomega.Expect(fw.Expose(types.UDP, listenAddr, "10.0.2.100:8081")).Should(gomega.Succeed())
+	defer func() { _ = fw.Unexpose(types.UDP, listenAddr) }()
+
+	clientConn, err := net.Dial("udp", listenAddr)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer clientConn.Close()
+	clientIP = clientConn.LocalAddr().(*net.UDPAddr).IP.String()
+
+	_, err = clientConn.Write([]byte("hello"))
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	// Read echo to ensure round-trip completes.
+	gomega.Expect(clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))).ShouldNot(gomega.HaveOccurred())
+	buf := make([]byte, 1024)
+	_, err = clientConn.Read(buf)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	var addr string
+	gomega.Eventually(sourceAddrCh).Should(gomega.Receive(&addr))
+	seen, _, err = net.SplitHostPort(addr)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	return seen, clientIP
+}
+
+// unboundTCPSource returns the source IP that a guest-side listener sees for a
+// TCP dial into the test stack that binds no local address.
+func unboundTCPSource() string {
+	s := newTestStack()
+	childAddr := tcpip.FullAddress{NIC: 1, Addr: childIP, Port: 8080}
+	childLn, err := gonet.ListenTCP(s, childAddr, ipv4.ProtocolNumber)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer childLn.Close()
+
+	conn, err := gonet.DialTCP(s, childAddr, ipv4.ProtocolNumber)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer conn.Close()
+
+	accepted, err := childLn.Accept()
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer accepted.Close()
+	return accepted.RemoteAddr().(*net.TCPAddr).IP.String()
+}
+
+// unboundUDPSource returns the source IP that a guest-side socket sees for a
+// UDP datagram sent into the test stack from a socket that binds no local address.
+func unboundUDPSource() string {
+	s := newTestStack()
+	childAddr := tcpip.FullAddress{NIC: 1, Addr: childIP, Port: 8081}
+	childConn, err := gonet.DialUDP(s, &childAddr, nil, ipv4.ProtocolNumber)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer childConn.Close()
+
+	conn, err := gonet.DialUDP(s, nil, &childAddr, ipv4.ProtocolNumber)
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	defer conn.Close()
+	_, err = conn.Write([]byte("hello"))
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	gomega.Expect(childConn.SetReadDeadline(time.Now().Add(5 * time.Second))).ShouldNot(gomega.HaveOccurred())
+	_, from, err := childConn.ReadFrom(make([]byte, 1024))
+	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+	return from.(*net.UDPAddr).IP.String()
+}
+
 var _ = ginkgo.Describe("port forwarding", func() {
 	ginkgo.It("should preserve the client source IP for TCP", func() {
-		ip := hostIP()
-		if ip == nil {
-			ginkgo.Skip("no non-loopback IPv4 address found")
-		}
-
-		s := newTestStack()
-
-		childLn, err := gonet.ListenTCP(s, tcpip.FullAddress{NIC: 1, Addr: childIP, Port: 8080}, ipv4.ProtocolNumber)
-		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
-		defer childLn.Close()
-
-		sourceAddrCh := make(chan string, 1)
-		go func() {
-			conn, err := childLn.Accept()
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			sourceAddrCh <- conn.RemoteAddr().String()
-			_, _ = io.Copy(io.Discard, conn)
-		}()
-
-		listenAddr := freeHostAddr("tcp", ip)
-		fw := NewPortsForwarder(s)
-		gomega.Expect(fw.Expose(types.TCP, listenAddr, "10.0.2.100:8080")).Should(gomega.Succeed())
-		defer func() { _ = fw.Unexpose(types.TCP, listenAddr) }()
-
-		conn, err := net.Dial("tcp", listenAddr)
-		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
-		clientIP := conn.LocalAddr().(*net.TCPAddr).IP.String()
-		conn.Close()
-
-		var addr string
-		gomega.Eventually(sourceAddrCh).WithTimeout(5 * time.Second).Should(gomega.Receive(&addr))
-		host, _, err := net.SplitHostPort(addr)
-		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+		host, clientIP := forwardTCP(false)
 		gomega.Expect(host).To(gomega.Equal(clientIP),
 			fmt.Sprintf("child saw %s, expected client IP %s (gateway is 10.0.2.1)", host, clientIP))
 	})
 
 	ginkgo.It("should preserve the client source IP for UDP", func() {
-		ip := hostIP()
-		if ip == nil {
-			ginkgo.Skip("no non-loopback IPv4 address found")
-		}
-
-		s := newTestStack()
-
-		childAddr := tcpip.FullAddress{NIC: 1, Addr: childIP, Port: 8081}
-		childConn, err := gonet.DialUDP(s, &childAddr, nil, ipv4.ProtocolNumber)
-		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
-		defer childConn.Close()
-
-		sourceAddrCh := make(chan string, 1)
-		go func() {
-			buf := make([]byte, 1024)
-			n, from, err := childConn.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			sourceAddrCh <- from.String()
-			// Echo back
-			_, _ = childConn.WriteTo(buf[:n], from)
-		}()
-
-		listenAddr := freeHostAddr("udp", ip)
-		fw := NewPortsForwarder(s)
-		gomega.Expect(fw.Expose(types.UDP, listenAddr, "10.0.2.100:8081")).Should(gomega.Succeed())
-		defer func() { _ = fw.Unexpose(types.UDP, listenAddr) }()
-
-		clientConn, err := net.Dial("udp", listenAddr)
-		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
-		defer clientConn.Close()
-		clientIP := clientConn.LocalAddr().(*net.UDPAddr).IP.String()
-
-		_, err = clientConn.Write([]byte("hello"))
-		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
-
-		// Read echo to ensure round-trip completes.
-		gomega.Expect(clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))).ShouldNot(gomega.HaveOccurred())
-		buf := make([]byte, 1024)
-		_, err = clientConn.Read(buf)
-		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
-
-		var addr string
-		gomega.Eventually(sourceAddrCh).Should(gomega.Receive(&addr))
-		host, _, err := net.SplitHostPort(addr)
-		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+		host, clientIP := forwardUDP(false)
 		gomega.Expect(host).To(gomega.Equal(clientIP),
 			fmt.Sprintf("child saw %s, expected client IP %s (gateway is 10.0.2.1)", host, clientIP))
+	})
+
+	ginkgo.It("should not propagate the client source IP for TCP when disabled", func() {
+		want := unboundTCPSource()
+		host, clientIP := forwardTCP(true)
+		gomega.Expect(host).To(gomega.Equal(want),
+			fmt.Sprintf("child saw %s, expected unbound dial source %s (client IP is %s)", host, want, clientIP))
+	})
+
+	ginkgo.It("should not propagate the client source IP for UDP when disabled", func() {
+		want := unboundUDPSource()
+		host, clientIP := forwardUDP(true)
+		gomega.Expect(host).To(gomega.Equal(want),
+			fmt.Sprintf("child saw %s, expected unbound dial source %s (client IP is %s)", host, want, clientIP))
 	})
 })
