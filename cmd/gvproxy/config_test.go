@@ -741,5 +741,26 @@ stack:
     tcpConnectTimeout: 10
 `,
 		},
+		{
+			CaseName: "config: disable source IP propagation",
+			Args:     []string{"-config", "config.yaml"},
+			InputConfig: `stack:
+    disableSourceIPPropagation: true
+`,
+			ResultConfig: `log-level: info
+stack:
+    mtu: 1500
+    subnet: 192.168.127.0/24
+    gatewayIP: 192.168.127.1
+    deviceIP: 192.168.127.2
+    hostIP: 192.168.127.254
+    gatewayMacAddress: 5a:94:ef:e4:0c:dd
+    disableSourceIPPropagation: true
+    nat:
+        192.168.127.254: 127.0.0.1
+    gatewayVirtualIPs:
+        - 192.168.127.254
+`,
+		},
 	}
 }
